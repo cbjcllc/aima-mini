@@ -1,0 +1,21 @@
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+# Local macOS metadata and signing material
+.DS_Store
+/.sign/
+
+# Reference Android app and extracted/reverse-engineering artifacts
+/AIMA.apk
+/AIMA-extracted-*/
+/docs/apk-analysis/
+/scripts/inspect-aima-apk.py
