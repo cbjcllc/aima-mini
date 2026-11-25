@@ -15,6 +15,10 @@
     {
       "name": "bluetooth_reason",
       "value": "用于搜索、连接您的爱玛车辆并接收车辆状态"
+    },
+    {
+      "name": "proximity_location_reason",
+      "value": "仅在开启持续感应时，利用后台位置变化重新寻找您的车辆；位置不保存、不上传"
     }
   ]
 }

@@ -10,7 +10,13 @@
     "deliveryWithInstall": true,
     "installationFree": false,
     "pages": "$profile:main_pages",
-    "requestPermissions": [{ "name": "ohos.permission.INTERNET" }, {
+    "requestPermissions": [{ "name": "ohos.permission.KEEP_BACKGROUND_RUNNING" },
+      { "name": "ohos.permission.APPROXIMATELY_LOCATION", "reason": "$string:proximity_location_reason",
+        "usedScene": { "abilities": ["EntryAbility"], "when": "always" } },
+      { "name": "ohos.permission.LOCATION", "reason": "$string:proximity_location_reason",
+        "usedScene": { "abilities": ["EntryAbility"], "when": "always" } },
+      { "name": "ohos.permission.LOCATION_IN_BACKGROUND", "reason": "$string:proximity_location_reason",
+        "usedScene": { "abilities": ["EntryAbility"], "when": "always" } }, { "name": "ohos.permission.INTERNET" }, {
       "name": "ohos.permission.ACCESS_BLUETOOTH",
       "reason": "$string:bluetooth_reason",
       "usedScene": { "abilities": ["EntryAbility"], "when": "inuse" }
@@ -18,6 +24,7 @@
     "abilities": [
       {
         "name": "EntryAbility",
+        "backgroundModes": ["bluetoothInteraction", "location"],
         "srcEntry": "./ets/entryability/EntryAbility.ets",
         "description": "$string:EntryAbility_desc",
         "icon": "$media:layered_image",

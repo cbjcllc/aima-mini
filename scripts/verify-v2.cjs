@@ -524,7 +524,7 @@ test('standard 10 uses its own characteristic authentication then confirms all f
     emit10(f.client, standard10.CONTROL10, reference10(command | 128, [0], f.sk));
     await operation; assert.equal(f.state().busy, false);
   }
-  await assert.rejects(service.control('inductionOn'), /尚未接入/);
+  await assert.rejects(service.control('unsupported'), /尚未接入/);
 });
 test('standard 10 rejects short, plaintext, and invalid-key authentication without opening controls', async () => {
   const f = await connect10();
@@ -583,4 +583,40 @@ test('standard 10 notification subscription failure after auth never marks the v
   emit10(f.client, standard10.AUTH10, reference10(0x83, Buffer.alloc(16), standardKey));
   await tick(); await tick(); assert.equal(f.state().ready, false); assert.equal(f.client.closed, true);
   assert.match(f.state().status, /subscribe failed/);
+});
+
+test('standard 10 power and proximity settings use distinct commands and acknowledged state', async () => {
+  const f = await ready10();
+  for (const [action, command, body] of [['powerOn', 2, [1]], ['powerOff', 2, [0]],
+    ['inductionOn', 7, [1, 186, 177, ...Array(17).fill(0)]],
+    ['inductionOff', 7, [0, 186, 177, ...Array(17).fill(0)]]]) {
+    const operation = service.control(action); await tick();
+    const sent = decodeReference10(f.client.writes.at(-1), f.sk);
+    assert.equal(sent.command, command); assert.deepEqual(sent.body, Buffer.from(body));
+    emit10(f.client, standard10.CONTROL10, reference10(command | 128, [0], f.sk)); await operation;
+  }
+  assert.equal(f.state().inductionState, 0); assert.equal(f.state().powerState, 0);
+  const query = service.queryInduction(); await tick();
+  assert.equal(decodeReference10(f.client.writes.at(-1), f.sk).command, 8);
+  emit10(f.client, standard10.QUERY10, reference10(0x88, [1,186,177,...Array(17).fill(0)], f.sk));
+  await query; assert.equal(f.state().inductionState, 1);
+  service.disconnect(); assert.equal(f.state().inductionState, -1);
+});
+
+test('standard 10 unsolicited heartbeat/report data does not contaminate the next control response', async () => {
+  const f = await ready10();
+  emit10(f.client, standard10.AUTH10, Buffer.from([0, 0]));
+  emit10(f.client, standard10.REPORT10, Buffer.from([0, 0]));
+  emit10(f.client, standard10.CONTROL10, Buffer.from([0, 0]));
+  await tick(); assert.equal(f.state().ready, true);
+  const operation = service.control('unlock'); await tick();
+  emit10(f.client, standard10.REPORT10, Buffer.from([0, 0]));
+  emit10(f.client, standard10.CONTROL10, reference10(0x81, [0], f.sk));
+  await operation; assert.equal(f.state().ready, true);
+});
+test('disconnected standard 10 cannot accidentally fall back to native V2 discovery', async () => {
+  const f = await ready10(); service.disconnect();
+  assert.equal(service.protocolType, 10);
+  assert.throws(() => service.connect(device), /协议 10 凭据已清除/);
+  assert.equal(service.authenticated, false);
 });

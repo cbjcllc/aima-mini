@@ -54,6 +54,7 @@ export class VehicleSnapshot {
   deviceName: string = '';
   scanning: boolean = false;
   connected: boolean = false;
+  connecting: boolean = false;
   ready: boolean = false;
   busy: boolean = false;
   devices: NearbyVehicle[] = [];
@@ -62,6 +63,7 @@ export class VehicleSnapshot {
   hornState: number = -1;
   powerState: number = -1;
   seatState: number = -1;
+  inductionState: number = -1;
 }
 
 class PendingCommand {
@@ -123,6 +125,11 @@ export class VehicleBleService {
   private handshakeTimer: number = -1;
   private writeType: ble.GattWriteType = ble.GattWriteType.WRITE;
 
+  get connectionActive(): boolean { return this.state.connected || this.state.connecting || this.state.scanning || this.state.busy; }
+  get inductionEnabled(): boolean { return this.state.inductionState === 1; }
+  get authenticated(): boolean { return this.state.ready; }
+  get protocolType(): number { return this.config.protocolType; }
+
   observe(listener: (state: VehicleSnapshot) => void): void {
     this.disposed = false; this.listener = listener; this.publish();
   }
@@ -130,9 +137,11 @@ export class VehicleBleService {
   private publish(): void {
     const next = new VehicleSnapshot();
     next.status = this.state.status; next.deviceName = this.state.deviceName;
+    next.connecting = this.state.connecting;
     next.scanning = this.state.scanning; next.connected = this.state.connected;
     next.ready = this.state.ready; next.busy = this.state.busy;
     next.devices = this.state.devices.slice(); next.characteristics = this.state.characteristics.slice();
+    next.inductionState = this.state.inductionState;
     next.lockState = this.state.lockState;
     next.hornState = this.state.hornState; next.powerState = this.state.powerState; next.seatState = this.state.seatState;
     this.listener(next);
@@ -161,22 +170,39 @@ export class VehicleBleService {
     this.publish();
   };
 
-  async scan(context: common.UIAbilityContext): Promise<void> {
+  async scan(context: common.UIAbilityContext, background: boolean = false): Promise<void> {
     if (this.state.scanning || this.requestingPermission || this.disposed) { return; }
     const scanGeneration = this.generation;
     this.requestingPermission = true;
     try {
-    const permission = await abilityAccessCtrl.createAtManager()
-      .requestPermissionsFromUser(context, ['ohos.permission.ACCESS_BLUETOOTH']);
+    const manager = abilityAccessCtrl.createAtManager();
+    let authResults: number[];
+    if (background) {
+      const result = await manager.checkAccessToken(context.applicationInfo.accessTokenId, 'ohos.permission.ACCESS_BLUETOOTH');
+      authResults = [result];
+    } else {
+      authResults = (await manager.requestPermissionsFromUser(context, ['ohos.permission.ACCESS_BLUETOOTH'])).authResults;
+    }
     if (this.disposed || scanGeneration !== this.generation) { return; }
-    if (permission.authResults.length === 0 || permission.authResults.some((value: number) => value !== 0)) {
+    if (authResults.length === 0 || authResults.some((value: number) => value !== 0)) {
       throw new Error('请在系统设置中允许蓝牙权限');
     }
     if (access.getState() !== access.BluetoothState.STATE_ON) { throw new Error('请先打开手机蓝牙'); }
     this.state.devices = [];
     ble.on('BLEDeviceFind', this.discovered);
     // SDK requires null for an unfiltered scan; an empty filter array is invalid.
-    try { ble.startBLEScan(null); } catch (error) {
+    try {
+      if (background && this.targetMac && this.standard) {
+        const manufacturer = new Uint8Array(24); const mask = new Uint8Array(24);
+        for (let i = 0; i < 6; i++) {
+          manufacturer[18 - i] = parseInt(this.targetMac.substring(i * 2, i * 2 + 2), 16); mask[18 - i] = 255;
+        }
+        const filters: ble.ScanFilter[] = [{ manufactureId: 0x01a8, manufactureData: manufacturer.buffer as ArrayBuffer,
+          manufactureDataMask: mask.buffer as ArrayBuffer }];
+        const options: ble.ScanOptions = { dutyMode: ble.ScanDuty.SCAN_MODE_LOW_POWER, matchMode: ble.MatchMode.MATCH_MODE_AGGRESSIVE };
+        ble.startBLEScan(filters, options);
+      } else { ble.startBLEScan(null); }
+    } catch (error) {
       ble.off('BLEDeviceFind', this.discovered); throw error as Error;
     }
     this.state.scanning = true; this.state.status = this.targetMac ? '正在寻找已选车辆（10 秒），找到后自动连接' : '正在搜索附近设备'; this.publish();
@@ -199,14 +225,14 @@ export class VehicleBleService {
     }
   }
 
-  async autoConnect(context: common.UIAbilityContext, mac: string): Promise<void> {
+  async autoConnect(context: common.UIAbilityContext, mac: string, background: boolean = false): Promise<void> {
     const normalized = mac.trim().replace(/[:-]/g, '').toUpperCase();
     if (!/^[0-9A-F]{12}$/.test(normalized)) { throw new Error('车辆蓝牙 MAC 缺失或无效，请使用手动连接'); }
     if (!this.standard && (!this.crypto || !this.credentialsUser || !this.credentialsKey)) { throw new Error('车辆缺少蓝牙凭据，无法自动验证'); }
     if (this.requestingPermission) { throw new Error('正在申请蓝牙权限，请稍后重试'); }
     this.disconnect(false);
     this.targetMac = normalized;
-    try { await this.scan(context); } catch (error) { this.targetMac = ''; throw error as Error; }
+    try { await this.scan(context, background); } catch (error) { this.targetMac = ''; throw error as Error; }
   }
 
   configure(config: VehicleConfig): void {
@@ -258,6 +284,7 @@ export class VehicleBleService {
   }
 
   connect(device: NearbyVehicle, automatic: boolean = false): void {
+    if (this.config.protocolType === 10 && !this.standard) { throw new Error('协议 10 凭据已清除，请点击重新自动连接以重新加载账号车辆'); }
     this.disconnect(this.client !== undefined);
     this.stopScan();
     this.autoHandshake = automatic; this.autoHandshakeStarted = false;
@@ -265,6 +292,7 @@ export class VehicleBleService {
     this.client = client;
     const generation = this.generation;
     this.state.deviceName = device.name; this.state.characteristics = [];
+    this.state.connecting = true;
     this.state.status = '正在连接 ' + device.name;
     client.on('BLEConnectionStateChange', (change: ble.BLEConnectionChangeState) => {
       if (generation !== this.generation) { return; }
@@ -275,6 +303,7 @@ export class VehicleBleService {
           if (generation !== this.generation) { return; }
           this.disconnect(); this.state.status = '车辆服务发现或订阅超时，请重试连接'; this.publish();
         }, 10000);
+        this.state.connecting = false;
         this.state.connected = true; this.state.status = '正在发现车辆服务'; this.publish();
         this.prepare(client, generation).catch((error: Error) => {
           if (generation === this.generation) {
@@ -430,6 +459,7 @@ export class VehicleBleService {
   private async exchangeStandard(uuid: string, command: number, packet: Uint8Array, generation: number): Promise<StandardMessage> {
     if (this.standardPending) { throw new Error('正在等待协议 10 车辆应答'); }
     return new Promise<StandardMessage>((resolve, reject) => {
+      this.standardBuffers.delete(uuid);
       const pending = new StandardPending(uuid, command, resolve, reject); this.standardPending = pending;
       pending.timer = setTimeout(() => {
         if (this.standardPending !== pending) { return; }
@@ -445,13 +475,16 @@ export class VehicleBleService {
 
   private async receiveStandard(uuid: string, bytes: Uint8Array, generation: number): Promise<void> {
     if (generation !== this.generation || !this.standard) { return; }
+    const waiting = this.standardPending;
+    // Unsolicited report/heartbeat traffic must not enter a request's frame buffer.
+    if (!waiting || waiting.uuid !== uuid) { this.standardBuffers.delete(uuid); return; }
     const old = this.standardBuffers.get(uuid) || new Uint8Array(0);
     if (old.length + bytes.length > 1024) { this.standardBuffers.delete(uuid); throw new Error('通知缓冲超长'); }
     const buffer = new Uint8Array(old.length + bytes.length); buffer.set(old); buffer.set(bytes, old.length);
     let offset = 0;
     while (buffer.length - offset >= 2) {
       const length = buffer[offset + 1] + 2;
-      if (length < 4) { this.standardBuffers.delete(uuid); throw new Error('应答包头错误'); }
+      if (length < 4) { this.standardBuffers.delete(uuid); throw new Error('操作应答包头错误（通道 ' + uuid.substring(4, 8) + '，长度 ' + bytes.length + '），请保留此状态用于排查'); }
       if (buffer.length - offset < length) { break; }
       const packet = buffer.slice(offset, offset + length); offset += length;
       const pending = this.standardPending;
@@ -522,6 +555,11 @@ export class VehicleBleService {
     if (this.state.busy) { throw new Error('正在等待车辆应答'); }
     let command = 0; let body = new Uint8Array(0);
     if (action === 'lock' || action === 'unlock') { command = 1; body = new Uint8Array([action === 'lock' ? 1 : 0]); }
+    else if (action === 'powerOn' || action === 'powerOff') { command = 2; body = new Uint8Array([action === 'powerOn' ? 1 : 0]); }
+    else if (action === 'inductionOn' || action === 'inductionOff') {
+      command = 7; body = new Uint8Array(20);
+      body[0] = action === 'inductionOn' ? 1 : 0; body[1] = 186; body[2] = 177;
+    }
     else if (action === 'horn') { command = 4; body = new Uint8Array([1, 3]); }
     else if (action === 'seat') { command = 11; body = new Uint8Array([1]); }
     else { throw new Error('协议 10 尚未接入该功能'); }
@@ -532,8 +570,28 @@ export class VehicleBleService {
       if (response.body.length === 0 || response.body[0] !== 0) { throw new Error('车辆未确认操作成功（返回 ' + (response.body.length ? response.body[0] : '空') + '）'); }
       if (action === 'lock') { this.state.lockState = '车辆已上锁'; }
       if (action === 'unlock') { this.state.lockState = '车辆已解锁'; }
-      this.state.status = '协议 10 车辆已确认操作'; this.publish();
+      if (action === 'inductionOn') { this.state.inductionState = 1; }
+      if (action === 'inductionOff') { this.state.inductionState = 0; }
+      if (action === 'powerOn') { this.state.powerState = 1; }
+      if (action === 'powerOff') { this.state.powerState = 0; }
+      this.state.status = action === 'inductionOn' ? '车辆已确认开启感应设置（标准距离），需保持蓝牙连接' :
+        action === 'inductionOff' ? '车辆已确认关闭感应设置' : '协议 10 车辆已确认操作'; this.publish();
       return new CommandResult(1, command, body[0], true);
+    } finally { if (generation === this.generation) { this.state.busy = false; this.publish(); } }
+  }
+
+  async queryInduction(): Promise<void> {
+    const session = this.standard; const generation = this.generation;
+    if (!session || !this.state.ready) { throw new Error('请先连接并认证协议 10 车辆'); }
+    if (this.state.busy) { throw new Error('正在等待车辆应答'); }
+    this.state.busy = true; this.publish();
+    try {
+      const packet = await session.controlPacket(8, new Uint8Array(0));
+      const response = await this.exchangeStandard(QUERY10, 0x88, packet, generation);
+      if (response.body.length < 20 || [0, 1, 2].indexOf(response.body[0]) < 0) { throw new Error('感应设置应答格式不匹配'); }
+      this.state.inductionState = response.body[0] === 0 ? 0 : 1;
+      this.state.status = '车辆感应设置：' + (this.state.inductionState === 0 ? '关闭' : '开启') +
+        '，阈值 ' + (response.body[1] - 255) + '/' + (response.body[2] - 255) + ' dBm'; this.publish();
     } finally { if (generation === this.generation) { this.state.busy = false; this.publish(); } }
   }
 
@@ -711,7 +769,9 @@ export class VehicleBleService {
       this.crypto?.clear(); this.crypto = undefined; this.credentialsUser = ''; this.credentialsKey = '';
     }
     this.payloadSize = 20; this.writeCharacteristic = undefined; this.notifyCharacteristic = undefined; this.seenNotifications.clear();
+    this.state.connecting = false;
     this.state.connected = false; this.state.ready = false; this.state.busy = false;
+    this.state.inductionState = -1;
     this.state.hornState = -1; this.state.powerState = -1; this.state.seatState = -1;
     this.state.lockState = '车辆状态未知'; this.state.status = '未连接车辆'; this.publish();
   }

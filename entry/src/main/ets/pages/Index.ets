@@ -1,3 +1,4 @@
+import { ProximityBackgroundService } from '../services/ProximityBackgroundService';
 import { accountVehicleConfig } from '../services/AccountVehicleProfile';
 import { AimaCloudService, CloudVehicle } from '../services/AimaCloudService';
 import { common } from '@kit.AbilityKit';
@@ -16,9 +17,12 @@ struct Index {
   @State userId: string = '';
   @State bluetoothKey: string = '';
   @State bindingInput: string = JSON.stringify(nativeCommandBindings());
+  private proximity: ProximityBackgroundService = new ProximityBackgroundService();
+  @State proximityRunning: boolean = false;
+  @State proximityStarting: boolean = false;
+  @State proximityMessage: string = '';
   private bleService: VehicleBleService = new VehicleBleService();
   @State seatOpen: boolean = false;
-  @State induction: boolean = false;
   private cloud: AimaCloudService = new AimaCloudService();
   @State acceptedTerms: boolean = false;
   @State cloudReady: boolean = false;
@@ -47,16 +51,31 @@ struct Index {
       .catch(() => { this.cloudMessage = '无法初始化登录设备信息，请重新打开应用'; });
     this.bleService.observe((state: VehicleSnapshot) => {
       this.vehicle = state;
-      if (!state.connected) { this.seatOpen = false; this.induction = false; }
+      if (!state.connected) { this.seatOpen = false; }
     });
   }
 
   aboutToDisappear(): void {
     this.selectionGeneration++;
+    this.proximity.stop().catch(() => {});
     this.bleService.dispose();
     this.cloud.release();
     if (this.smsTimer !== -1) { clearInterval(this.smsTimer); }
     this.sessionInput = ''; this.userId = ''; this.bluetoothKey = '';
+  }
+
+  private async toggleProximity(): Promise<void> {
+    if (this.proximityStarting) { return; }
+    if (this.proximityRunning) { await this.proximity.stop(); this.proximityRunning = false; this.tip('持续感应已关闭'); return; }
+    const item = this.cloudVehicles.find((value: CloudVehicle) => value.vinCode === this.selectedVin);
+    if (!item || !item.bluetoothMac) { this.tip('请先选择带蓝牙地址的车辆'); return; }
+    this.proximityStarting = true;
+    try {
+      await this.proximity.start(this.getUIContext().getHostContext() as common.UIAbilityContext, this.bleService,
+        item.bluetoothMac, accountVehicleConfig(item), (message: string) => { this.proximityMessage = message; });
+      this.proximityRunning = true;
+    } catch (error) { this.tip((error as Error).message); }
+    finally { this.proximityStarting = false; }
   }
 
   private async scan(): Promise<void> {
@@ -90,8 +109,6 @@ struct Index {
     try {
       await this.bleService.control(action);
       if (action === 'seat') { this.seatOpen = true; }
-      if (action === 'inductionOn') { this.induction = true; }
-      if (action === 'inductionOff') { this.induction = false; }
       this.tip('车辆已确认操作');
     } catch (error) { this.tip((error as Error).message); }
   }
@@ -141,6 +158,19 @@ struct Index {
           })
         Button('刷新状态').backgroundColor('#E9EFEB').fontColor('#345D49').enabled(this.selectedProtocol !== 10 && this.vehicle.ready && !this.vehicle.busy)
           .onClick(() => this.bleService.queryStatus().catch((error: Error) => this.tip(error.message)))
+      }
+      if (this.selectedProtocol === 10) {
+        Row() { Text('感应解锁：' + (this.vehicle.inductionState < 0 ? '未读取' : this.vehicle.inductionState === 1 ? '车辆设置已开启' : '车辆设置已关闭')).fontSize(15); Button(this.proximityStarting ? '正在申请权限…' : this.proximityRunning ? '停止持续感应' : '开启持续感应').enabled(!this.proximityStarting).backgroundColor(this.green).onClick(() => this.toggleProximity()) }.width('100%')
+        Row({ space: 8 }) {
+          Button('读取设置').enabled(this.vehicle.ready && !this.vehicle.busy)
+            .onClick(() => this.bleService.queryInduction().catch((error: Error) => this.tip(error.message)))
+          Button('开启').enabled(this.vehicle.ready && !this.vehicle.busy).backgroundColor(this.green)
+            .onClick(() => this.control('inductionOn'))
+          Button('关闭').enabled(this.vehicle.ready && !this.vehicle.busy)
+            .onClick(() => this.control('inductionOff'))
+        }
+        Text(this.proximityMessage).fontSize(12).fontColor(this.green)
+        Text('标准距离由车辆根据信号判断，当前只在应用保持蓝牙连接时使用；后台持续运行和离车自动重连尚未完成。').fontSize(11).fontColor('#78917E')
       }
       Text('用户与车辆凭据').fontSize(16).fontWeight(FontWeight.Medium).width('100%')
       TextInput({ placeholder: '车辆授权 UUID（车辆接口返回，非登录用户 ID）', text: this.userId })
@@ -255,7 +285,7 @@ struct Index {
           Text('连接设置  ›').fontSize(11).fontColor('#94A39A').onClick(() => this.showConnection = !this.showConnection)
         }.width('100%')
         Row({ space: 16 }) {
-          Button(this.vehicle.busy ? '等待车辆应答…' : this.vehicle.lockState === '车辆已解锁' ? '▢  点击上锁' : '▣  点击解锁')
+          Button(this.vehicle.busy ? '等待车辆应答…' : this.vehicle.lockState === '车辆已解锁' ? '▢  点击设防' : '▣  点击撤防')
             .fontSize(18).fontWeight(FontWeight.Medium).fontColor(Color.White)
             .backgroundColor(this.green).borderRadius(18).height(62).layoutWeight(1)
             .enabled(!this.vehicle.busy)
@@ -268,9 +298,19 @@ struct Index {
         Row() {
           this.action('⌁', '寻车鸣笛', false, () => this.control('horn'))
           this.action('▱', this.seatOpen ? '座桶已开' : '打开座桶', this.seatOpen, () => this.control('seat'))
-          this.action('◉', '感应解锁', this.induction, () => this.control(this.induction ? 'inductionOff' : 'inductionOn'))
+          this.action('◉', '感应设置', this.vehicle.inductionState === 1, () => this.showConnection = true)
           this.action('⚙', '车辆设置', false, () => this.showConnection = !this.showConnection)
         }.width('100%')
+        if (this.selectedProtocol === 10) {
+          Row({ space: 12 }) {
+            Button('车辆上电').layoutWeight(1).backgroundColor(this.green).enabled(this.vehicle.ready && !this.vehicle.busy)
+              .onClick(() => this.control('powerOn'))
+            Button('车辆断电').layoutWeight(1).backgroundColor('#E9EFEB').fontColor('#345D49').enabled(this.vehicle.ready && !this.vehicle.busy)
+              .onClick(() => this.control('powerOff'))
+          }.width('100%')
+          Text('撤防不等于上电。感应设置需保持蓝牙认证连接；当前尚不保证锁屏、后台及离车再靠近时持续生效。')
+            .fontSize(11).fontColor('#78917E')
+        }
       }.padding(20).width('100%').backgroundColor(Color.White).borderRadius(24)
 
       Row() {
@@ -337,6 +377,7 @@ struct Index {
 
   private clearAccountVehicle(): void {
     this.selectionGeneration++;
+    this.proximity.stop().catch(() => {});
     this.bleService.dispose();
     this.bleService.observe((state: VehicleSnapshot) => { this.vehicle = state; });
     this.cloudVehicles = []; this.userId = ''; this.bluetoothKey = '';
@@ -346,6 +387,7 @@ struct Index {
 
   private async selectVehicle(item: CloudVehicle): Promise<void> {
     const selection = ++this.selectionGeneration;
+    await this.proximity.stop(); this.proximityRunning = false;
     this.bleService.disconnect();
     this.selectedProtocol = Number(item.evcuType);
     this.selectedVin = item.vinCode; this.selectedVehicleName = item.vehicleNick || '我的爱玛';
@@ -416,19 +458,6 @@ struct Index {
   }
 
   @Builder
-  otherPage(title: string, subtitle: string, icon: string) {
-    Column({ space: 20 }) {
-      Text(title).fontSize(28).fontWeight(FontWeight.Bold).fontColor('#193D2E').width('100%')
-      Text(icon).fontSize(65).fontColor(this.green).margin({ top: 65 })
-      Text(subtitle).fontSize(18).fontWeight(FontWeight.Medium).fontColor('#345D49')
-      Text(this.selectedTab === 1 ? '骑行记录与沿途风景，将在这里相遇' : '连接你的爱玛，开启便捷出行生活')
-        .fontSize(13).fontColor('#8A9E91')
-      Button('返回我的车辆').backgroundColor(this.green).margin({ top: 20 })
-        .onClick(() => this.selectedTab = 0)
-    }.width('100%').padding(24)
-  }
-
-  @Builder
   tab(icon: string, label: string, index: number) {
     Column({ space: 5 }) {
       Text(icon).fontSize(23).fontWeight(FontWeight.Medium)
@@ -444,16 +473,14 @@ struct Index {
       Scroll() {
         if (this.selectedTab === 0) {
           this.vehiclePage()
-        } else if (this.selectedTab === 1) {
-          this.otherPage('发现', '每一程，都有新发现', '☼')
+
         } else {
           this.accountPage()
         }
       }.layoutWeight(1).scrollBar(BarState.Off).align(Alignment.Top)
       Row() {
         this.tab('▰', '爱车', 0)
-        this.tab('◎', '发现', 1)
-        this.tab('♙', '我的', 2)
+        this.tab('♙', '我的', 1)
       }.width('100%').backgroundColor(Color.White)
         .border({ width: { top: 0.5 }, color: '#E8EEE9' })
     }.width('100%').height('100%').backgroundColor('#F4F7F4')
