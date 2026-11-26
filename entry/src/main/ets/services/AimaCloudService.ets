@@ -9,6 +9,7 @@ import { util } from '@kit.ArkTS';
 export interface CloudVehicle {
   vinCode: string;
   uuid?: string;
+  owner?: number;
   evcuType?: string | number;
   vehicleNick?: string;
   bluetoothMac?: string;
@@ -94,6 +95,15 @@ export class AimaCloudService {
   async rememberVehicle(vin: string): Promise<void> {
     if (!this.identity || !this.devicePreferences) { return; }
     await this.devicePreferences.put('vehicle.' + this.identity, vin);
+    await this.devicePreferences.flush();
+  }
+  async proximityEnabled(vin: string): Promise<boolean> {
+    if (!this.identity || !this.devicePreferences || !vin) { return false; }
+    return (await this.devicePreferences.get('proximity.' + this.identity + '.' + vin, false)) === true;
+  }
+  async rememberProximity(vin: string, enabled: boolean): Promise<void> {
+    if (!this.identity || !this.devicePreferences || !vin) { throw new Error('请先恢复账号和车辆信息'); }
+    await this.devicePreferences.put('proximity.' + this.identity + '.' + vin, enabled);
     await this.devicePreferences.flush();
   }
   get accountLabel(): string { return this.label; }

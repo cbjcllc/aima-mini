@@ -27,7 +27,7 @@ function fixture() {
   const service=new module.exports.ProximityBackgroundService();
   const ble={authenticated:false,connectionActive:false,inductionEnabled:false,scans:0,controls:0,
     configure:()=>{},autoConnect:async()=>{ble.scans++;},
-    control:async()=>{ble.controls++;}, queryInduction:async()=>{ble.inductionEnabled=true;} };
+    enableInduction:async()=>{ble.controls++;ble.inductionEnabled=true;},cancelInductionSetup:()=>{}, queryInduction:async()=>{ble.inductionEnabled=true;} };
   return {service,ble,tasks,messages,timers,events,start:()=>service.start({abilityInfo:{bundleName:'test',name:'EntryAbility'}},ble,'AA',{},m=>messages.push(m))};
 }
 test('continuous proximity can start disconnected and schedules first connection without manual authentication',async()=>{
@@ -42,7 +42,16 @@ test('already connected vehicle confirms induction before reporting running',asy
   await f.service.stop();
 });
 test('failed vehicle confirmation never reports induction running',async()=>{
-  const f=fixture();f.ble.authenticated=true;f.ble.queryInduction=async()=>{};
+  const f=fixture();f.ble.authenticated=true;f.ble.enableInduction=async()=>{};f.ble.queryInduction=async()=>{};
   await f.start();await tick();await tick();assert.equal(f.messages.includes('持续感应运行中，车端设置已确认'),false);
   assert.ok(f.messages.some(m=>m.includes('仍为关闭')));await f.service.stop();
+});
+
+test('cancelled system pairing stops automatic prompts until the user restarts proximity',async()=>{
+  const f=fixture();f.ble.authenticated=true;f.ble.connectionActive=true;
+  f.ble.enableInduction=async()=>{f.ble.controls++;throw new Error('车辆系统蓝牙配对被取消');};
+  await f.start();await tick();await tick();assert.equal(f.ble.controls,1);
+  for(const timer of f.timers.values())timer();await tick();await tick();
+  assert.equal(f.ble.controls,1);assert.ok(f.messages.some(m=>m.includes('停止后重新开启')));
+  assert.equal(f.messages.includes('持续感应运行中，车端设置已确认'),false);await f.service.stop();
 });

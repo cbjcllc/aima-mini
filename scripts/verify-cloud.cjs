@@ -148,3 +148,23 @@ test('last selected vehicle is scoped to the restored account', async () => {
   await f.service.login('13800000000', '123456');
   assert.equal(await f.service.lastVehicleVin(), '');
 });
+
+test('proximity preference survives service recreation and is scoped to account and vehicle', async () => {
+  const f = fixture(); await f.service.initialize({});
+  assert.equal(await f.service.proximityEnabled('vin-a'), false);
+  f.set(ok({userId:'account-a',accessToken:'token-a'})); await f.service.login('13800000000','123456');
+  await f.service.rememberProximity('vin-a', true);
+  const restored = new f.service.constructor(); await restored.initialize({});
+  assert.equal(await restored.proximityEnabled('vin-a'), true);
+  assert.equal(await restored.proximityEnabled('vin-b'), false);
+  restored.logout();
+  assert.equal(await restored.proximityEnabled('vin-a'), false);
+  f.set(ok({userId:'account-b',accessToken:'token-b'})); await restored.login('13800000000','123456');
+  assert.equal(await restored.proximityEnabled('vin-a'), false);
+  restored.logout();
+  f.set(ok({userId:'account-a',accessToken:'token-a'})); await restored.login('13800000000','123456');
+  assert.equal(await restored.proximityEnabled('vin-a'), true);
+  await restored.rememberProximity('vin-a', false);
+  const disabled = new f.service.constructor(); await disabled.initialize({});
+  assert.equal(await disabled.proximityEnabled('vin-a'), false);
+});

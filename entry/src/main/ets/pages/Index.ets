@@ -19,6 +19,7 @@ struct Index {
   @State bindingInput: string = JSON.stringify(nativeCommandBindings());
   private proximity: ProximityBackgroundService = new ProximityBackgroundService();
   @State proximityRunning: boolean = false;
+  @State proximityEnabled: boolean = false;
   @State proximityStarting: boolean = false;
   @State proximityMessage: string = '';
   private bleService: VehicleBleService = new VehicleBleService();
@@ -64,18 +65,37 @@ struct Index {
     this.sessionInput = ''; this.userId = ''; this.bluetoothKey = '';
   }
 
-  private async toggleProximity(): Promise<void> {
-    if (this.proximityStarting) { return; }
-    if (this.proximityRunning) { await this.proximity.stop(); this.proximityRunning = false; this.tip('持续感应已关闭'); return; }
-    const item = this.cloudVehicles.find((value: CloudVehicle) => value.vinCode === this.selectedVin);
-    if (!item || !item.bluetoothMac) { this.tip('请先选择带蓝牙地址的车辆'); return; }
+  private async startProximity(item: CloudVehicle, selection: number): Promise<void> {
     this.proximityStarting = true;
     try {
       await this.proximity.start(this.getUIContext().getHostContext() as common.UIAbilityContext, this.bleService,
-        item.bluetoothMac, accountVehicleConfig(item), (message: string) => { this.proximityMessage = message; });
-      this.proximityRunning = true;
-    } catch (error) { this.tip((error as Error).message); }
-    finally { this.proximityStarting = false; }
+        item.bluetoothMac || '', accountVehicleConfig(item), (message: string) => {
+          if (selection === this.selectionGeneration) { this.proximityMessage = message; this.proximityRunning = this.proximity.isRunning; }
+        });
+      if (selection === this.selectionGeneration) { this.proximityRunning = this.proximity.isRunning; }
+    } finally { if (selection === this.selectionGeneration) { this.proximityStarting = false; } }
+  }
+
+  private async toggleProximity(): Promise<void> {
+    if (this.proximityStarting) { return; }
+    const item = this.cloudVehicles.find((value: CloudVehicle) => value.vinCode === this.selectedVin);
+    if (!item || !item.bluetoothMac) { this.tip('请先选择带蓝牙地址的车辆'); return; }
+    const selection = this.selectionGeneration;
+    try {
+      if (this.proximityEnabled) {
+        await this.cloud.rememberProximity(item.vinCode, false);
+        this.proximityEnabled = false;
+        await this.proximity.stop(); this.proximityRunning = false;
+        this.proximityMessage = '持续感应已关闭'; return;
+      }
+      await this.startProximity(item, selection);
+      if (selection !== this.selectionGeneration || !this.proximity.isRunning) { return; }
+      await this.cloud.rememberProximity(item.vinCode, true);
+      if (selection === this.selectionGeneration) { this.proximityEnabled = true; }
+    } catch (error) {
+      if (!this.proximityEnabled) { await this.proximity.stop().catch(() => {}); this.proximityRunning = false; }
+      this.tip((error as Error).message);
+    }
   }
 
   private async scan(): Promise<void> {
@@ -107,7 +127,8 @@ struct Index {
 
   private async control(action: string): Promise<void> {
     try {
-      await this.bleService.control(action);
+      if (action === 'inductionOn' && this.selectedProtocol === 10) { await this.bleService.enableInduction(); }
+      else { await this.bleService.control(action); }
       if (action === 'seat') { this.seatOpen = true; }
       this.tip('车辆已确认操作');
     } catch (error) { this.tip((error as Error).message); }
@@ -160,7 +181,7 @@ struct Index {
           .onClick(() => this.bleService.queryStatus().catch((error: Error) => this.tip(error.message)))
       }
       if (this.selectedProtocol === 10) {
-        Row() { Text('感应解锁：' + (this.vehicle.inductionState < 0 ? '未读取' : this.vehicle.inductionState === 1 ? '车辆设置已开启' : '车辆设置已关闭')).fontSize(15); Button(this.proximityStarting ? '正在申请权限…' : this.proximityRunning ? '停止持续感应' : '开启持续感应').enabled(!this.proximityStarting).backgroundColor(this.green).onClick(() => this.toggleProximity()) }.width('100%')
+        Row() { Text('感应解锁：' + (this.vehicle.inductionState < 0 ? '未读取' : this.vehicle.inductionState === 1 ? '车辆设置已开启' : '车辆设置已关闭')).fontSize(15); Button(this.proximityStarting ? '正在启动感应…' : this.proximityEnabled ? '停止持续感应' : '开启持续感应').enabled(!this.proximityStarting).backgroundColor(this.green).onClick(() => this.toggleProximity()) }.width('100%')
         Row({ space: 8 }) {
           Button('读取设置').enabled(this.vehicle.ready && !this.vehicle.busy)
             .onClick(() => this.bleService.queryInduction().catch((error: Error) => this.tip(error.message)))
@@ -229,8 +250,8 @@ struct Index {
     Column({ space: 20 }) {
       Row() {
         Row({ space: 7 }) {
-          Text('AIMA').fontSize(25).fontWeight(FontWeight.Bold).fontStyle(FontStyle.Italic).fontColor('#153F31')
-          Text('爱玛出行').fontSize(15).fontWeight(FontWeight.Medium).fontColor('#234D3C')
+          Text('近骑').fontSize(25).fontWeight(FontWeight.Bold).fontStyle(FontStyle.Italic).fontColor('#153F31')
+          Text('随身车钥匙').fontSize(15).fontWeight(FontWeight.Medium).fontColor('#234D3C')
         }
         Blank()
         Text('＋').fontSize(28).fontColor('#244D3B').onClick(() => this.showConnection = !this.showConnection)
@@ -245,7 +266,7 @@ struct Index {
               Text(this.selectedVehicleName || this.vehicle.deviceName || '我的爱玛').fontSize(25).fontWeight(FontWeight.Bold).fontColor('#193D2E')
               Text('⌄').fontSize(20).fontColor('#587768')
             }
-            Text(this.vehicle.connected ? 'AIMA · 蓝牙连接' : '添加车辆，开启智能出行').fontSize(12).fontColor('#739084')
+            Text(this.vehicle.connected ? '近骑 · 蓝牙连接' : '添加车辆，开启智能出行').fontSize(12).fontColor('#739084')
           }.alignItems(HorizontalAlign.Start)
           Blank()
           Text(this.vehicle.connected ? '● 已连接' : '○ 未连接').fontSize(11).fontColor('#42856A')
@@ -377,6 +398,7 @@ struct Index {
 
   private clearAccountVehicle(): void {
     this.selectionGeneration++;
+    this.proximityEnabled = false; this.proximityRunning = false; this.proximityStarting = false; this.proximityMessage = '';
     this.proximity.stop().catch(() => {});
     this.bleService.dispose();
     this.bleService.observe((state: VehicleSnapshot) => { this.vehicle = state; });
@@ -387,7 +409,9 @@ struct Index {
 
   private async selectVehicle(item: CloudVehicle): Promise<void> {
     const selection = ++this.selectionGeneration;
-    await this.proximity.stop(); this.proximityRunning = false;
+    this.proximityEnabled = false; this.proximityStarting = false; this.proximityMessage = '';
+    await this.proximity.stop();
+    if (selection !== this.selectionGeneration) { return; } this.proximityRunning = false;
     this.bleService.disconnect();
     this.selectedProtocol = Number(item.evcuType);
     this.selectedVin = item.vinCode; this.selectedVehicleName = item.vehicleNick || '我的爱玛';
@@ -399,7 +423,21 @@ struct Index {
       this.bleService.configure(config); this.userId = config.userId;
       await this.cloud.rememberVehicle(item.vinCode);
       if (selection !== this.selectionGeneration) { return; }
-      await this.bleService.autoConnect(this.getUIContext().getHostContext() as common.UIAbilityContext, item.bluetoothMac || '');
+      const enabled = await this.cloud.proximityEnabled(item.vinCode);
+      if (selection !== this.selectionGeneration) { return; }
+      this.proximityEnabled = enabled;
+      if (enabled) {
+        this.proximityMessage = '正在恢复持续感应，等待重新连接并核对车端设置';
+        try { await this.startProximity(item, selection); }
+        catch (error) {
+          if (selection === this.selectionGeneration) {
+            await this.proximity.stop().catch(() => {}); this.proximityRunning = false;
+            this.proximityMessage = '持续感应已保存，恢复失败：' + (error as Error).message + '；排除原因后重新连接车辆可重试';
+          }
+        }
+      } else {
+        await this.bleService.autoConnect(this.getUIContext().getHostContext() as common.UIAbilityContext, item.bluetoothMac || '');
+      }
     } catch (error) { this.cloudMessage = (error as Error).message; this.tip(this.cloudMessage); }
   }
 

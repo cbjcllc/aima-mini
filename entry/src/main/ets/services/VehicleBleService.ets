@@ -1,3 +1,4 @@
+import { VehiclePairing } from './VehiclePairing';
 import { Standard10Session, StandardMessage, encodeStandard, standardAdvertisedMac, AUTH10, CONTROL10, QUERY10, REPORT10 } from '../protocol/Standard10';
 import { access, ble, constant } from '@kit.ConnectivityKit';
 import { abilityAccessCtrl, common } from '@kit.AbilityKit';
@@ -37,6 +38,7 @@ export function nativeCommandBindings(): CommandBinding[] {
 
 export class VehicleConfig {
   protocolType: number = 2;
+  owner: number = 0;
   serviceUuid: string = '';
   writeUuid: string = '';
   notifyUuid: string = '';
@@ -93,6 +95,10 @@ class StandardPending {
 }
 
 export class VehicleBleService {
+  private pairing: VehiclePairing = new VehiclePairing();
+  private connectedDeviceId: string = '';
+  private inductionSetupGeneration: number = 0;
+  private inductionSetupActive: boolean = false;
   private standard?: Standard10Session;
   private standardCharacteristics: Map<string, ble.BLECharacteristic> = new Map();
   private standardBuffers: Map<string, Uint8Array> = new Map();
@@ -274,6 +280,7 @@ export class VehicleBleService {
     // Do not retain the hex strings, only the in-memory provider and public mapping.
     const clean = new VehicleConfig();
     clean.protocolType = config.protocolType;
+    clean.owner = config.owner;
     clean.serviceUuid = config.serviceUuid.toLowerCase(); clean.writeUuid = config.writeUuid.toLowerCase();
     clean.notifyUuid = config.notifyUuid.toLowerCase(); clean.bindings = config.bindings;
     this.config = clean;
@@ -289,7 +296,7 @@ export class VehicleBleService {
     this.stopScan();
     this.autoHandshake = automatic; this.autoHandshakeStarted = false;
     const client = ble.createGattClientDevice(device.id);
-    this.client = client;
+    this.client = client; this.connectedDeviceId = device.id;
     const generation = this.generation;
     this.state.deviceName = device.name; this.state.characteristics = [];
     this.state.connecting = true;
@@ -520,6 +527,9 @@ export class VehicleBleService {
         await this.client.setCharacteristicChangeNotification(characteristic, true);
         if (generation !== this.generation || !this.client) { return; }
       }
+      // APK VehicleHeartManager._startHeart sends the first role-bearing heartbeat immediately.
+      await this.writeStandard(AUTH10, await this.standardHeartbeatPacket(), generation);
+      if (generation !== this.generation || !this.client) { return; }
       this.state.ready = true; this.state.status = '协议 10 车辆鉴权成功'; this.publish();
       this.scheduleStandardHeartbeat(generation);
     } catch (error) {
@@ -533,7 +543,7 @@ export class VehicleBleService {
       if (generation !== this.generation || !this.standard || !this.state.ready) { return; }
       try {
         if (!this.state.busy) {
-          // APK's normal heartbeat is unencrypted bind command 0x11; 0xff is its default user marker.
+          // APK normal heartbeat: unencrypted bind command 0x11 with the vehicle owner-role marker.
           const packet = await this.standardHeartbeatPacket();
           await this.writeStandard(AUTH10, packet, generation);
         }
@@ -546,7 +556,10 @@ export class VehicleBleService {
   }
 
   private async standardHeartbeatPacket(): Promise<Uint8Array> {
-    return encodeStandard(0x11, new Uint8Array([255]));
+    // VehicleBean.owner field_4f -> VehicleHeartManager._startHeart (0xd1fa80..0xd1fb20).
+    const owner = this.config.owner;
+    const marker = owner === 1 ? 0 : (owner >= 20 && owner <= 22 && Number.isInteger(owner) ? owner - 19 : 255);
+    return encodeStandard(0x11, new Uint8Array([marker]));
   }
 
   private async controlStandard(action: string): Promise<CommandResult> {
@@ -570,14 +583,57 @@ export class VehicleBleService {
       if (response.body.length === 0 || response.body[0] !== 0) { throw new Error('车辆未确认操作成功（返回 ' + (response.body.length ? response.body[0] : '空') + '）'); }
       if (action === 'lock') { this.state.lockState = '车辆已上锁'; }
       if (action === 'unlock') { this.state.lockState = '车辆已解锁'; }
-      if (action === 'inductionOn') { this.state.inductionState = 1; }
+      if (action === 'inductionOn') { this.state.inductionState = -1; }
       if (action === 'inductionOff') { this.state.inductionState = 0; }
       if (action === 'powerOn') { this.state.powerState = 1; }
       if (action === 'powerOff') { this.state.powerState = 0; }
-      this.state.status = action === 'inductionOn' ? '车辆已确认开启感应设置（标准距离），需保持蓝牙连接' :
+      this.state.status = action === 'inductionOn' ? '感应设置写入已应答，需完成系统配对并读取确认' :
         action === 'inductionOff' ? '车辆已确认关闭感应设置' : '协议 10 车辆已确认操作'; this.publish();
       return new CommandResult(1, command, body[0], true);
     } finally { if (generation === this.generation) { this.state.busy = false; this.publish(); } }
+  }
+
+  cancelInductionSetup(): void {
+    this.inductionSetupGeneration++;
+    this.pairing.cancel();
+  }
+
+  async enableInduction(): Promise<void> {
+    if (!this.standard || !this.state.ready || !this.connectedDeviceId) { throw new Error('请先连接并认证协议 10 车辆'); }
+    if (this.inductionSetupActive) { throw new Error('正在设置车辆感应解锁'); }
+    const setup = ++this.inductionSetupGeneration;
+    const generation = this.generation;
+    const deviceId = this.connectedDeviceId;
+    this.inductionSetupActive = true;
+    const check = (): void => {
+      if (setup !== this.inductionSetupGeneration || generation !== this.generation || !this.state.ready) {
+        throw new Error('感应设置流程已取消或车辆连接已变化');
+      }
+    };
+    try {
+      // APK _onOpenReaction: enable -> query (zero may mean pairing is still pending).
+      await this.controlStandard('inductionOn'); check();
+      await this.queryInduction(); check();
+      if (!this.inductionEnabled) {
+        // APK step 3 (0xdef800): repeat enable before opening the pairing dialog.
+        await this.controlStandard('inductionOn'); check();
+      }
+      this.state.inductionState = -1;
+      this.state.status = '正在完成车辆系统蓝牙配对，请确认系统配对弹窗'; this.publish();
+      await this.pairing.ensure(deviceId); check();
+      // APK onCallOhosSysPairDialog (0xdf1714..0xdf1874): bond, then enable again.
+      await this.controlStandard('inductionOn'); check();
+      await this.queryInduction(); check();
+      if (!this.inductionEnabled) {
+        throw new Error('系统配对已完成，但车端感应仍为关闭；请保持车辆唤醒后重新开启');
+      }
+      this.state.status = '系统蓝牙已配对，车辆感应设置已读取确认'; this.publish();
+    } catch (error) {
+      if (generation === this.generation) {
+        this.state.inductionState = -1; this.state.status = (error as Error).message; this.publish();
+      }
+      throw error as Error;
+    } finally { this.inductionSetupActive = false; }
   }
 
   async queryInduction(): Promise<void> {
@@ -586,9 +642,14 @@ export class VehicleBleService {
     if (this.state.busy) { throw new Error('正在等待车辆应答'); }
     this.state.busy = true; this.publish();
     try {
-      const packet = await session.controlPacket(8, new Uint8Array(0));
-      const response = await this.exchangeStandard(QUERY10, 0x88, packet, generation);
-      if (response.body.length < 20 || [0, 1, 2].indexOf(response.body[0]) < 0) { throw new Error('感应设置应答格式不匹配'); }
+      // APK query reaction enum index 7 maps through the jump table to wire command 7 (not index + 1).
+      const packet = await session.controlPacket(7, new Uint8Array(0));
+      const response = await this.exchangeStandard(QUERY10, 0x87, packet, generation);
+      if (response.body.length < 20 || [0, 1, 2].indexOf(response.body[0]) < 0) {
+        this.state.inductionState = -1;
+        throw new Error('感应设置应答格式不匹配（查询 0x07，数据长度 ' + response.body.length +
+          '，模式 ' + (response.body.length ? response.body[0] : '空') + '）');
+      }
       this.state.inductionState = response.body[0] === 0 ? 0 : 1;
       this.state.status = '车辆感应设置：' + (this.state.inductionState === 0 ? '关闭' : '开启') +
         '，阈值 ' + (response.body[1] - 255) + '/' + (response.body[2] - 255) + ' dBm'; this.publish();
@@ -596,6 +657,7 @@ export class VehicleBleService {
   }
 
   async control(action: string): Promise<CommandResult> {
+    if (this.inductionSetupActive) { throw new Error('正在完成感应设置与系统配对，请稍候'); }
     if (this.standard) { return this.controlStandard(action); }
     if (!this.state.ready || !this.crypto || !this.client || !this.writeCharacteristic) {
       throw new Error('请先连接车辆并配置已认证的本地会话');
@@ -743,6 +805,7 @@ export class VehicleBleService {
   }
 
   disconnect(clearSession: boolean = true): void {
+    this.cancelInductionSetup(); this.connectedDeviceId = '';
     this.generation++; clearTimeout(this.heartbeatTimer); clearTimeout(this.authDelayTimer);
     this.authDelayReject?.(new Error('车辆连接已取消')); this.authDelayReject = undefined;
     if (this.standardPending) {

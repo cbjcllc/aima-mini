@@ -21,6 +21,7 @@ export function accountVehicleConfig(vehicle: CloudVehicle): VehicleConfig {
   }
   const config = new VehicleConfig();
   config.protocolType = Number(vehicle.evcuType);
+  config.owner = typeof vehicle.owner === 'number' && Number.isInteger(vehicle.owner) ? vehicle.owner : 0;
   config.userId = vehicle.uuid || '';
   config.bluetoothKey = vehicle.bluetoothKey;
   config.bindings = config.protocolType === 10 ? [] : nativeCommandBindings();

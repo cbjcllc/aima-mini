@@ -20,12 +20,14 @@ export class ProximityBackgroundService {
   private generation: number = 0;
   private inductionConfirmed: boolean = false;
   private bluetoothTask: boolean = false;
+  private confirmationBlocked: boolean = false;
+  private vehicleService?: VehicleBleService;
 
   async start(context: common.UIAbilityContext, bleService: VehicleBleService, mac: string, config: VehicleConfig,
     onMessage: (message: string) => void): Promise<void> {
     if (this.running) { return; }
     const generation = ++this.generation;
-    this.inductionConfirmed = false;
+    this.inductionConfirmed = false; this.confirmationBlocked = false; this.vehicleService = bleService;
     this.context = context; this.callback = onMessage;
     await requestProximityPermissions(context);
     if (generation !== this.generation) { return; }
@@ -47,7 +49,7 @@ export class ProximityBackgroundService {
     this.suspendCallback = () => this.message('后台感应暂时暂停，系统等待蓝牙恢复连接');
     this.activeCallback = () => this.message('后台感应已恢复');
     this.cancelCallback = () => {
-      this.running = false; clearInterval(this.retryTimer);
+      this.running = false; this.vehicleService?.cancelInductionSetup(); clearInterval(this.retryTimer);
       if (this.locationActive) { geoLocationManager.off('locationChange', this.locationCallback); this.locationActive = false; }
       this.message('后台感应任务已被系统停止');
     };
@@ -57,12 +59,16 @@ export class ProximityBackgroundService {
     this.locationCallback = () => {
       if (!this.running || generation !== this.generation || this.retrying) { return; }
       if (bleService.authenticated && !this.inductionConfirmed) {
+        if (this.confirmationBlocked) { return; }
         if (Date.now() - this.lastScanAt < 15000) { return; }
         this.lastScanAt = Date.now();
         this.retrying = true;
         this.message('已连接车辆，正在开启并核对车端感应设置');
         this.confirmInduction(bleService, generation, context).catch((error: Error) => {
-          if (generation === this.generation) { this.message('感应设置确认失败：' + error.message + '，将重试'); }
+          if (generation === this.generation) {
+            this.confirmationBlocked = error.message.indexOf('配对') >= 0;
+            this.message('感应设置确认失败：' + error.message + (this.confirmationBlocked ? '；请停止后重新开启持续感应重试' : '，将重试'));
+          }
         }).finally(() => { if (generation === this.generation) { this.retrying = false; } });
         return;
       }
@@ -85,7 +91,7 @@ export class ProximityBackgroundService {
   }
   private async confirmInduction(bleService: VehicleBleService, generation: number,
     context: common.UIAbilityContext): Promise<void> {
-    await bleService.control('inductionOn');
+    await bleService.enableInduction();
     if (!this.running || generation !== this.generation) { return; }
     await bleService.queryInduction();
     if (!bleService.inductionEnabled) { throw new Error('车辆感应设置仍为关闭'); }
@@ -111,6 +117,7 @@ export class ProximityBackgroundService {
     this.message('持续感应运行中，车端设置已确认');
   }
   async stop(): Promise<void> {
+    this.vehicleService?.cancelInductionSetup();
     this.generation++; this.retrying = false; this.lastScanAt = 0; this.inductionConfirmed = false;
     clearInterval(this.retryTimer);
     this.running = false;

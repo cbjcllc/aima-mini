@@ -70,10 +70,21 @@ const ble = {
   startBLEScan: filters => { assert.equal(filters, null, 'unfiltered SDK scan requires null, not []'); scanning = true; }, stopBLEScan: () => { scanning = false; },
   createGattClientDevice: () => (latestClient = new FakeGatt()), GattWriteType: { WRITE: 1, WRITE_NO_RESPONSE: 2 }
 };
+let bondState = 0;
+let bondHandler;
+let pairCalls = [];
+let pairRequest = async () => {};
+const connection = {
+  BondState: { BOND_STATE_INVALID:0, BOND_STATE_BONDING:1, BOND_STATE_BONDED:2 },
+  getPairState: () => bondState,
+  on: (event, fn) => { assert.equal(event, 'bondStateChange'); bondHandler=fn; },
+  off: (event, fn) => { if (bondHandler === fn) bondHandler=undefined; },
+  pairDevice: id => { pairCalls.push(id); return pairRequest(); }
+};
 const mocks = {
   '@kit.ArkTS': { util: { TextEncoder: class { encodeInto(value) { return new TextEncoder().encode(value); } } } },
   '@kit.CryptoArchitectureKit': { cryptoFramework: framework },
-  '@kit.ConnectivityKit': { ble, access: { getState: () => bluetoothOn ? 2 : 0,
+  '@kit.ConnectivityKit': { ble, connection, access: { getState: () => bluetoothOn ? 2 : 0,
     BluetoothState: { STATE_ON: 2 } }, constant: { ProfileConnectionState: { STATE_CONNECTED: 2, STATE_DISCONNECTED: 0 } } },
   '@kit.AbilityKit': { abilityAccessCtrl: { createAtManager: () => ({ requestPermissionsFromUser: async () => ({ authResults: permissions }) }) } }
 };
@@ -101,7 +112,7 @@ const mac = Buffer.from('test-local-session-key');
 const provider = () => new HarmonyV2Crypto(aes, iv, mac);
 const device = new NearbyVehicle('test-id', 'Test vehicle', -45);
 let service;
-afterEach(() => { service?.dispose(); service = undefined; permissions = [0]; bluetoothOn = true; timers.clear(); });
+afterEach(() => { service?.dispose(); service = undefined; permissions = [0]; bluetoothOn = true; timers.clear(); bondState=0;bondHandler=undefined;pairCalls=[];pairRequest=async()=>{}; });
 function config() {
   const c = new VehicleConfig();
   Object.assign(c, { serviceUuid, writeUuid, notifyUuid, nativeTransport: false, userId: 'test-user', bluetoothKey: 'test-vehicle-key',
@@ -489,9 +500,9 @@ function standardCharacteristics() {
 function emit10(client, uuid, packet) {
   client.emit('BLECharacteristicChange', { ...characteristic(uuid), characteristicValue: Uint8Array.from(packet).buffer });
 }
-async function connect10() {
+async function connect10(owner = 0) {
   service = new VehicleBleService();
-  const c = new VehicleConfig(); c.protocolType = 10; c.bluetoothKey = standardKey.toString('hex');
+  const c = new VehicleConfig(); c.protocolType = 10; c.owner = owner; c.bluetoothKey = standardKey.toString('hex');
   service.configure(c); let state; service.observe(s => state = s);
   await service.autoConnect({}, 'AA:BB:CC:DD:EE:FF');
   scanCallback([{ deviceId: 'AA:BB:CC:DD:EE:FF', deviceName: 'Standard vehicle', rssi: -40, connectable: true }]);
@@ -505,8 +516,8 @@ async function connect10() {
   assert.equal(client.writes.length, 2); assert.equal(decodeReference10(client.writes[1], standardKey).command, 3);
   return { client, state: () => state, subscriptions };
 }
-async function ready10() {
-  const f = await connect10(); const challenge = Buffer.alloc(16, 0x53);
+async function ready10(owner = 0) {
+  const f = await connect10(owner); const challenge = Buffer.alloc(16, 0x53);
   const response = reference10(0x83, challenge, standardKey);
   emit10(f.client, standard10.AUTH10, response.subarray(0, 7)); await tick(); assert.equal(f.state().ready, false);
   emit10(f.client, standard10.AUTH10, response.subarray(7)); await tick(); await tick();
@@ -514,6 +525,25 @@ async function ready10() {
   f.sk = crypto.createHash('sha256').update(standardKey).update(challenge).digest().subarray(0, 16);
   return f;
 }
+test('standard 10 immediately sends the APK owner-role heartbeat and preserves it on periodic ticks', async () => {
+  for (const [owner, marker] of [[1,0],[20,1],[21,2],[22,3],[0,255],[2,255],[23,255]]) {
+    const f = await ready10(owner);
+    let packet = decodeReference10(f.client.writes.at(-1));
+    assert.equal(packet.command, 0x11); assert.deepEqual(packet.body, Buffer.from([marker]));
+    [...timers.values()].find(t => t.ms === 5000).fn(); await tick();
+    packet = decodeReference10(f.client.writes.at(-1));
+    assert.equal(packet.command, 0x11); assert.equal(packet.body[0], marker);
+    service.disconnect();
+  }
+});
+test('account profile uses service owner role, never login userType, for heartbeat identity', () => {
+  const { accountVehicleConfig } = load(path.join(root, 'services/AccountVehicleProfile.ets'));
+  const vehicle = { vinCode:'vin', evcuType:10, bluetoothMac:'AA:BB:CC:DD:EE:FF', bluetoothKey:standardKey.toString('hex') };
+  assert.equal(accountVehicleConfig({...vehicle,owner:1}).owner,1);
+  assert.equal(accountVehicleConfig({...vehicle,userType:1}).owner,0);
+  assert.equal(accountVehicleConfig({...vehicle,owner:'1'}).owner,0);
+});
+
 test('standard 10 uses its own characteristic authentication then confirms all four controls', async () => {
   const f = await ready10();
   for (const [action, command, body] of [['lock', 1, [1]], ['unlock', 1, [0]], ['horn', 4, [1, 3]], ['seat', 11, [1]]]) {
@@ -597,10 +627,32 @@ test('standard 10 power and proximity settings use distinct commands and acknowl
   }
   assert.equal(f.state().inductionState, 0); assert.equal(f.state().powerState, 0);
   const query = service.queryInduction(); await tick();
-  assert.equal(decodeReference10(f.client.writes.at(-1), f.sk).command, 8);
-  emit10(f.client, standard10.QUERY10, reference10(0x88, [1,186,177,...Array(17).fill(0)], f.sk));
+  assert.equal(decodeReference10(f.client.writes.at(-1), f.sk).command, 7);
+  emit10(f.client, standard10.QUERY10, reference10(0x87, [1,186,177,...Array(17).fill(0)], f.sk));
   await query; assert.equal(f.state().inductionState, 1);
   service.disconnect(); assert.equal(f.state().inductionState, -1);
+});
+
+test('standard 10 reaction query rejects truncated or unknown modes and clears optimistic state', async () => {
+  for (const body of [[1], [3,186,177,...Array(17).fill(0)]]) {
+    const f = await ready10();
+    const enable = service.control('inductionOn'); await tick();
+    emit10(f.client, standard10.CONTROL10, reference10(0x87, [0], f.sk)); await enable;
+    assert.equal(f.state().inductionState, -1);
+    const query = service.queryInduction(); await tick();
+    emit10(f.client, standard10.QUERY10, reference10(0x87, body, f.sk));
+    await assert.rejects(query, /查询 0x07，数据长度/);
+    assert.equal(f.state().inductionState, -1); assert.equal(f.state().busy, false);
+    service.disconnect();
+  }
+});
+test('standard 10 reaction query accepts APK optional trailing data and DIY mode', async () => {
+  const f = await ready10(); const query = service.queryInduction(); await tick();
+  const request = decodeReference10(f.client.writes.at(-1), f.sk);
+  assert.equal(request.command, 0x07); assert.equal(request.body.length, 0);
+  emit10(f.client, standard10.QUERY10, reference10(0x87, [2,186,177,...Array(17).fill(0),1], f.sk));
+  await query; assert.equal(f.state().inductionState, 1);
+  assert.match(f.state().status, /-69\/-78 dBm/); service.disconnect();
 });
 
 test('standard 10 unsolicited heartbeat/report data does not contaminate the next control response', async () => {
@@ -619,4 +671,72 @@ test('disconnected standard 10 cannot accidentally fall back to native V2 discov
   assert.equal(service.protocolType, 10);
   assert.throws(() => service.connect(device), /协议 10 凭据已清除/);
   assert.equal(service.authenticated, false);
+});
+
+const { VehiclePairing } = load(path.join(root, 'services/VehiclePairing.ets'));
+test('pairing request completion alone cannot confirm bonding; unrelated device events are ignored', async () => {
+  bondState=0; pairCalls=[];
+  const pairing=new VehiclePairing(); let completed=false;
+  const operation=pairing.ensure('AA:BB:CC:DD:EE:FF').then(()=>completed=true); await tick();
+  assert.equal(completed,false); assert.deepEqual(pairCalls,['AA:BB:CC:DD:EE:FF']);
+  bondHandler({deviceId:'00:11:22:33:44:55',state:2}); await tick(); assert.equal(completed,false);
+  bondHandler({deviceId:'aa:bb:cc:dd:ee:ff',state:2}); await operation;
+  assert.equal(completed,true);assert.equal(bondHandler,undefined);
+  assert.equal([...timers.values()].some(t=>t.ms===30000),false);
+});
+test('pairing timeout, rejection, cancellation and existing bond clean up their listeners', async () => {
+  for (const reason of ['timeout','rejected','cancelled','request']) {
+    bondState=0;const pairing=new VehiclePairing();
+    pairRequest=reason==='request' ? async()=>{throw new Error('permission denied');} : async()=>{};
+    const operation=pairing.ensure('AA:BB:CC:DD:EE:FF');
+    const rejected=assert.rejects(operation,/配对/); await tick();
+    if(reason==='timeout') [...timers.values()].find(t=>t.ms===30000).fn();
+    if(reason==='rejected') bondHandler({deviceId:'AA:BB:CC:DD:EE:FF',state:0});
+    if(reason==='cancelled') pairing.cancel();
+    await rejected;assert.equal(bondHandler,undefined);
+  }
+  pairRequest=async()=>{};bondState=2;pairCalls=[];
+  await new VehiclePairing().ensure('AA:BB:CC:DD:EE:FF');assert.equal(pairCalls.length,0);
+});
+async function replyReaction(f, channel, body) {
+  emit10(f.client,channel,reference10(0x87,body,f.sk));await tick();await tick();
+}
+test('induction enable follows APK write/query/pair/re-enable/query even when initial status is off', async () => {
+  bondState=0;pairCalls=[];pairRequest=async()=>{};
+  const f=await ready10();const operation=service.enableInduction();await tick();
+  assert.equal(decodeReference10(f.client.writes.at(-1),f.sk).command,7);
+  await replyReaction(f,standard10.CONTROL10,[0]);
+  await replyReaction(f,standard10.QUERY10,[0,186,177,...Array(17).fill(0)]);
+  await replyReaction(f,standard10.CONTROL10,[0]);
+  assert.deepEqual(pairCalls,['AA:BB:CC:DD:EE:FF']);assert.equal(f.state().inductionState,-1);
+  const before=f.client.writes.length;
+  bondState=2;bondHandler({deviceId:'AA:BB:CC:DD:EE:FF',state:2});await tick();await tick();
+  assert.equal(f.client.writes.length,before+1);
+  assert.deepEqual(decodeReference10(f.client.writes.at(-1),f.sk).body,Buffer.from([1,186,177,...Array(17).fill(0)]));
+  await replyReaction(f,standard10.CONTROL10,[0]);
+  assert.equal(f.state().inductionState,-1);
+  await replyReaction(f,standard10.QUERY10,[1,186,177,...Array(17).fill(0)]);
+  await operation;assert.equal(f.state().inductionState,1);assert.match(f.state().status,/系统蓝牙已配对/);
+});
+test('stopping or disconnecting during pairing prevents subsequent enable writes', async () => {
+  for (const stop of [()=>service.cancelInductionSetup(),()=>service.disconnect()]) {
+    bondState=0;pairRequest=async()=>{};const f=await ready10();
+    const operation=service.enableInduction();const rejected=assert.rejects(operation,/取消|断开|变化/);await tick();
+    await replyReaction(f,standard10.CONTROL10,[0]);
+    await replyReaction(f,standard10.QUERY10,[0,186,177,...Array(17).fill(0)]);
+    await replyReaction(f,standard10.CONTROL10,[0]);
+    const before=f.client.writes.length;stop();await rejected;await tick();
+    assert.equal(f.client.writes.length,before);assert.equal(bondHandler,undefined);assert.equal(f.state().inductionState,-1);
+    service.disconnect();
+  }
+});
+test('a successful system bond and write acknowledgement cannot hide a final disabled vehicle status', async () => {
+  bondState=2;pairCalls=[];const f=await ready10();const operation=service.enableInduction();
+  const rejected=assert.rejects(operation,/系统配对已完成，但车端感应仍为关闭/);await tick();
+  await replyReaction(f,standard10.CONTROL10,[0]);
+  await replyReaction(f,standard10.QUERY10,[0,186,177,...Array(17).fill(0)]);
+  await replyReaction(f,standard10.CONTROL10,[0]);
+  await replyReaction(f,standard10.CONTROL10,[0]);
+  await replyReaction(f,standard10.QUERY10,[0,186,177,...Array(17).fill(0)]);
+  await rejected;assert.equal(pairCalls.length,0);assert.equal(f.state().inductionState,-1);
 });
